@@ -515,9 +515,9 @@ Default CSD - A CSD to run when Csound starts
       (if (>= iv pto)
           (if (not resultlist) (setq resultlist (append resultlist (list iv)))
 	    (nconc resultlist (list iv)))))
-    (setq resultlist (sort resultlist pred))    
+    (setq resultlist (sort resultlist pred))
     (dolist (listoff resultlist)
-      (heap-modify *OFFSET-HEAP* '(lambda(n)(= n listoff))
+      (heap-modify *OFFSET-HEAP* `(lambda(n)(= n ,listoff))
 		   (if (eq pred '>=)
 		       (+ listoff tlen)
 		     (- listoff tlen))))))
@@ -571,11 +571,7 @@ Default CSD - A CSD to run when Csound starts
 	  (message "Finished playing *TIMEQUEUE*")
 	  (setq cslc--recordingflag "Finished Playback")
 	  (setq cslc--performance-start-time nil)
-	  )
-	)
-      )
-    )
-  )
+	  )))))
 ;==================================================
 ;RECORDING
 ;==================================================
