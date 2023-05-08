@@ -888,7 +888,7 @@ Default CSD - A CSD to run when Csound starts
 ;; Not implemented Yet
 ;;;;;;;;;;;;;;;;;;;;
 
-
+;;;###autoload
 (define-minor-mode cslc-mode
   "Record live code performances with Csound"
   :init-value nil
