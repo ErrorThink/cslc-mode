@@ -539,10 +539,8 @@ Default CSD - A CSD to run when Csound starts
 	(let ((current-point (point-marker))
 	      (pto (goto-char (+ pt (cslc--calc-offset pt)))))
 	  (when (< (point-max) pto) (goto-char (point-max))
-		(message "hit point-max in buffer")
-		;;(insert "\n\n\n\n\n\n\n\n\n\n")
-		)
-	  (setq action (replace-regexp-in-string "\\\\n" "\n" action))
+		(message "hit point-max in buffer"))
+	  (setq action (replace-regexp-in-string "\\^J" "\n" action))
 	  (setq action (replace-regexp-in-string "\vert" "|" action))
 	  (cond ((not cslc--performance-start-time) (setq next-time nil))
 		((string-prefix-p "MODE:" action)
@@ -583,7 +581,7 @@ Default CSD - A CSD to run when Csound starts
 	 (tlen (length text))
 	 (pt beg)
 	 (buf (buffer-name)))
-    (setq text (replace-regexp-in-string "\n" "\\\\n" text))
+    (setq text (replace-regexp-in-string "[\n$]" "^J" text))
     (setq text (replace-regexp-in-string "|" "\vert" text))
     (when (= tlen 0) (setq text "\b") (setq tlen (* len -1)))
     ;; (if *RECORD-INSERT-OFFSETS* (record-playback-offset pt tlen))
@@ -612,6 +610,19 @@ Default CSD - A CSD to run when Csound starts
       (set-buffer (get-buffer-create (concat "*" (buffer-name) "-TIMEQUEUE*")))
       (insert (format "%s " time) "|" action "|" 
 	      (format "%s|%s|%s\n" pt 0 buf)))))
+
+
+(defun cslc--record-existing-buffer-contents ()
+  "records the existing change of mode event in a timequeue"
+  (let ((time (time-since cslc--record-start-time))
+	(text (buffer-string))
+	(buf (buffer-name)))
+    (setq text (replace-regexp-in-string "[\n$]" "^J" text))
+    (setq text (replace-regexp-in-string "|" "\vert" text))
+    (save-current-buffer
+      (set-buffer (get-buffer-create (concat "*" (buffer-name) "-TIMEQUEUE*")))
+      (insert (format "%s " time) "|" text "|" (format "%s|%s|%s\n" (point-min) 0 buf)))))
+
 
 
 (defun cslc--perform-timequeue ()
@@ -724,7 +735,7 @@ Default CSD - A CSD to run when Csound starts
   (interactive)
   (setq cslc--recordingflag "Resumed Performance Playback")  
   (toggle-pause-csd-clock)
-  (if (= (buffer-size *TIMEQUEUE*) 0)
+  (if (zerop (buffer-size *TIMEQUEUE*))
       (progn
 	(message "%s" "*TIMEQUEUE* EMPTY - setting PST to now")
 	(setq cslc--performance-start-time (current-time)))
@@ -749,6 +760,8 @@ Default CSD - A CSD to run when Csound starts
       (setq cslc--record-start-time cslc--performance-start-time))
     (setq cslc--recording t)
     (cslc--record-mode-change (format "%s" major-mode))
+    (unless (zerop (buffer-size))
+      (cslc--record-existing-buffer-contents))
     (add-hook 'after-change-functions
 	      'cslc--record-every-buffer-mod nil t)
     (setq cslc--recording-buffer-count (+ cslc--recording-buffer-count 1))
