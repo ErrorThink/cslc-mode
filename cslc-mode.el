@@ -1,11 +1,11 @@
 ;;; cslc-mode.el --- Minor mode for recording live code sessions with Csound. -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2023, Thorin Kerr
+;; Copyright (C) 2024, Thorin Kerr
 
 ;; Author: Thorin Kerr <thorin.kerr@gmail.com>
 ;; Keywords: livecoding live-coding csound
 ;; Compatibility: GNU Emacs 25.2.2
-;; Version: 0.1
+;; Version: 0.2
  
 ;; This file is NOT part of GNU Emacs
 
@@ -120,6 +120,9 @@
 ;;; Code:
 
 ;;Public Interface Functions ;;;;;;;;;;;;;;;;;;;;;;;
+
+(message "RUNNING CSLC")
+
 (require 'generator)
 (require 'cl-lib)
 (require 'heap)
@@ -210,7 +213,7 @@ Note that these over-ride csd flags"
 (defun cslc-new-scheduler ()
   "Template for a tempo recursion instrument"
   (interactive)
-  (save-excursion (insert "instr Sched" (get-snumber) "
+  (save-excursion (insert "instr Sched" (cslc--get-snumber) "
 
 schedule p1, nextbeat(1), 1
 
@@ -439,6 +442,14 @@ Default CSD - A CSD to run when Csound starts
 (defun cslc--play-eval (s)
   "evaluate the item in timequeue"
   (let ((lsted (split-string (substring s 6) "#")))
+    (when (and (string-suffix-p "-InDir" (buffer-name)) (buffer-local-value 'cslc--recording (buffer-base-buffer)))
+      (let ((time (time-since cslc--record-start-time))
+	    (action s)	    
+	    (pt (point))
+	    (bfr (buffer-base-buffer)))
+	(with-current-buffer (get-buffer-create (concat "*" (buffer-name bfr) "-TIMEQUEUE*"))
+	  (insert (format "%s " time) "|" action "|" 
+		  (format "%s|%s|%s\n" pt 0 (buffer-name bfr))))))    
     (apply (read lsted) (read (cadr lsted)))))
 
 (defun cslc--string-reverse (str)
@@ -468,95 +479,122 @@ Default CSD - A CSD to run when Csound starts
 	 (buf (get-buffer inbufname)))	 
     (if buf buf (make-indirect-buffer basename inbufname t))))
 
+(defun cslc--count-offsets-at-pt (pt)
+   (let ((ohiter (heap-iter *OFFSET-HEAP*))
+	 (delcount-at-pt 0)
+	 (inserts-at-pt 0))
+     (iter-do (offpt ohiter)
+       (cond ((> offpt pt) (iter-close ohiter))
+	     ((= offpt (- pt)) (setq delcount-at-pt (1+ delcount-at-pt)))	     
+	     ((= offpt pt) (setq inserts-at-pt (1+ inserts-at-pt)))))
+     (- inserts-at-pt delcount-at-pt)))
+
 (defun cslc--record-buffer-offsets (beg end len)
   "At character insertion, or deletion, adds the point to the local buffer heap.
    Deletions are stored as negative points"
-    (let* ((tlen (- end beg))
-	   (pt beg)
-	   (buf (buffer-name))
-	   (indbuf (get-buffer (concat " " buf "-InDir"))))
-      (with-current-buffer indbuf	
-	(cond ((= tlen 1) (heap-add *OFFSET-HEAP* pt))
+  (let* ((tlen (- end beg))
+	 (pt beg)
+	 (text (buffer-substring beg end))
+	 (buf (buffer-name))
+	 (indbuf (get-buffer (concat " " buf "-InDir"))))
+    (with-current-buffer indbuf
+      (when (cslc--ac-filter text tlen pt end len)
+	(cond ((= tlen 1)
+	       (heap-add *OFFSET-HEAP* pt)
+	       (cslc--shift-offsets pt tlen '>=))
 	      ((> tlen 1)
 	       (dolist (bs (number-sequence pt (+ pt (- tlen 1))))
-		 (heap-add *OFFSET-HEAP* bs)))
-	      ((and (zerop tlen) (zerop len)) (heap-add *OFFSET-HEAP* (* pt -1)))
-	      ((and (zerop tlen) (> len 0)) (dolist (ds (number-sequence (+ pt (- len 1)) pt -1))
-					      (heap-add *OFFSET-HEAP* (* ds -1))))
-	      (t '())))))
+		 (heap-add *OFFSET-HEAP* bs))
+	       (cslc--shift-offsets pt tlen '>=))
+	      ((and (zerop tlen) (= len 1))
+	       (heap-add *OFFSET-HEAP* (- pt))
+	       (cslc--shift-offsets pt (- len) '>=)) ;pt + 1, or just pt?
+	      ((and (zerop tlen) (> len 0))
+	       (dolist (ds (number-sequence (+ pt (- len 1)) pt -1))
+		 (heap-add *OFFSET-HEAP* (- ds)))
+	       (cslc--shift-offsets (+ pt len) (- len) '>=))
+	      (t (message "RBO:!!!!!!!SHOULD NOT BE HERE") '()
+		 ))))))
 
 ;;calculate the offset to move the inserrt from the recorded point
 (defun cslc--calc-offset (pt)
   "Reads the buffer local heap at point (pt) and calculates the tally of current deletions and insertions.
   The result is used in cslc--pollaction to displace the recorded point in timequeue"
    (let ((ohiter (heap-iter *OFFSET-HEAP*))
-	(tally 0)
-	(last -1))
-     (iter-do (iv ohiter) 
-       (cond ((and (< iv 0) (<= (abs iv) pt)) (setq tally (1- tally)))
-	     ((and (> iv 0) (< iv pt)) (setq tally (1+ tally)))
-	     ((= iv pt)
+	 (tally 0)
+	 (last -1)
+	 (delcount-at-pt 0))
+     (iter-do (offpt ohiter)
+       (cond ((and (= (signum offpt) -1) (< (abs offpt) pt))
+	      (setq tally (1- tally)))
+	     ((and (= (signum offpt) -1) (= (abs offpt) pt))
+	      (setq tally (1- tally))
+	      (setq delcount-at-pt (1+ delcount-at-pt)))
+	     ((and (= (signum offpt) -1) (> (abs offpt) pt))
+	      nil)
+	     ((and (< offpt pt))
+	      (setq tally (1+ tally)))
+	     ((= offpt pt)
+	      (setq last offpt)
 	      (setq tally (1+ tally))
-	      (setq last iv))
-	     ((= iv (1+ last))
-	      (setq tally (1+ tally))
-	      (setq last iv))
-	     ((>= iv (+ last 2))
-	      '())
-	     (t '())))
+	      )
+	     ((or (= offpt (1+ last)) (= offpt last))
+	      (let ((offtot (cslc--count-offsets-at-pt offpt)))
+		(cond ((<= offtot 0)
+		       nil)
+		      (t (setq last offpt)	      
+			 (setq tally (1+ tally))
+			 ))))
+	     ((>= offpt (+ last 2))
+	      nil)
+	     (t (message "calc-offset shouldn't be here pt=%s offpt=%s last=%s tally=%s" pt offpt last tally))))     
      tally))
 
-
 (defun cslc--shift-offsets (pto tlen pred)
-  "shift all the offsets after point in the heap."
+  "shift all the recorded offsets after point in the heap. "
   (let ((ofiter (heap-iter *OFFSET-HEAP*))
-	(resultlist '()))
+	(resultlist '(0)))
     (iter-do (iv ofiter)
-      (if (>= iv pto)
-          (if (not resultlist) (setq resultlist (append resultlist (list iv)))
-	    (nconc resultlist (list iv)))))
+      (when (>= (abs iv) pto) (push resultlist iv)))
     (setq resultlist (sort resultlist pred))
     (dolist (listoff resultlist)
       (heap-modify *OFFSET-HEAP* `(lambda(n)(= n ,listoff))
-		   (if (eq pred '>=)
-		       (+ listoff tlen)
-		     (- listoff tlen))))))
+		   (+ listoff (* tlen (signum listoff)))))))
 
 (defun cslc--pollaction (&optional nowtime)
   "Playback the recorded *TIMEQUEUE* performance"
-  (when cslc--performance-start-time 
-    (save-current-buffer
-      (set-buffer *TIMEQUEUE*)
+  (when cslc--performance-start-time
+    (with-current-buffer *TIMEQUEUE*
       (let* ((event (split-string (thing-at-point 'line) "|"))
-	     (action (elt event 1))
+	     (action (replace-regexp-in-string "\\^J" "\n"
+					       (replace-regexp-in-string "\vert" "|" (elt event 1))))
 	     (pt (string-to-number (elt event 2)))
 	     (len (string-to-number (elt event 3)))
 	     (destinationbuf (cslc--perfbuffer-name (elt event 4)))
+	     (indirectbuf (cslc--get-indirect-buffer-create destinationbuf))
 	     (now (if nowtime nowtime 0.0))
 	     (next-time (progn (forward-line 1)
 			       (if (eobp) nil (read (thing-at-point 'line))))))
-	(set-buffer (cslc--get-indirect-buffer-create destinationbuf))
-	(let ((current-point (point-marker))
-	      (pto (goto-char (+ pt (cslc--calc-offset pt)))))
-	  (when (< (point-max) pto) (goto-char (point-max))
-		(message "hit point-max in buffer"))
-	  (setq action (replace-regexp-in-string "\\^J" "\n" action))
-	  (setq action (replace-regexp-in-string "\vert" "|" action))
-	  (cond ((not cslc--performance-start-time) (setq next-time nil))
-		((string-prefix-p "MODE:" action)
-		 (let ((mm (substring action 5)))
-		   (if (not (string= major-mode mm)) 
-		       (funcall (intern (substring action 5))))))
-		((string= action "\b")
-		 (delete-region pto (+ pto len))
-		 (cslc--shift-offsets pto len '<=))
-		((string-prefix-p "ELISP:" action) (cslc--play-eval action))
-		((> len 0) '())
-		(t 
-		 (insert action)
-		 (cslc--shift-offsets pto (length action) '>=)))
-	  (goto-char (marker-position current-point)))
-	(set-buffer *TIMEQUEUE*)
+	(with-current-buffer indirectbuf
+	  (let ((pto (+ pt (cslc--calc-offset pt))))
+	    ;;(message "pt|pto|diff ========== %s | %s | %s" pt pto (- pto pt))
+	    (save-excursion
+	      (if (< (point-max) pto) (goto-char (point-max)) (goto-char pto))
+	      (cond ((not cslc--performance-start-time) (setq next-time nil))
+		    ((string-prefix-p "MODE:" action)
+		     (let ((mm (substring action 5)))
+		       (if (not (string= major-mode mm)) 
+			   (funcall (intern (substring action 5))))))
+		    ((string= action "\b")
+		     (delete-region pto (+ pto len))
+		     (cslc--shift-offsets (+ pto len) (- len) '>=)
+		     )
+		    ((string-prefix-p "ELISP:" action) (cslc--play-eval action))
+		    ;;((> len 0) (message "pollaction - shouldn't be here"))
+		    (t
+		     (insert action)
+		     (cslc--shift-offsets pto (length action) '>=)
+		     )))))
 	(if next-time
 	    (let* ((nt (float-time next-time))
 		   (calctime (/ (- nt now) cslc--speed)))
@@ -568,11 +606,32 @@ Default CSD - A CSD to run when Csound starts
 	       ))
 	  (message "Finished playing *TIMEQUEUE*")
 	  (setq cslc--recordingflag "Finished Playback")
-	  (setq cslc--performance-start-time nil)
-	  )))))
+	  (setq cslc--performance-start-time nil))))))
+
 ;==================================================
 ;RECORDING
 ;==================================================
+(defun cslc--ac-filter (text tlen pt end len)
+  "private function to ignore auto-complete shenanigans"
+  (if (not (boundp 'auto-complete-mode))
+      (progn (message "(not (boundp 'auto-complete)) - returning t")
+	     t)
+    (let* ((overlays (overlays-in (point-min) (point-max)))
+	   (afterstring (when overlays
+			  (let (ostring)
+			    (dolist (o overlays)
+			      (when (overlay-get o 'after-string) (setq ostring (overlay-get o 'after-string))))
+			    ostring))))
+      (cond ((and overlays (not afterstring) (> tlen 0) (string-prefix-p "\n" text))
+	     (when (= end (point-max))
+	       (setq-local cslc--olay-tlen tlen))
+	     nil)
+	    ((and (= tlen 0) (= pt (point-max)) (> cslc--olay-tlen 0))
+	     (setq-local cslc--olay-tlen (- cslc--olay-tlen len))
+	     nil)
+	    (t
+	     t)))))
+
 (defun cslc--record-every-buffer-mod (beg end len)
   "records every change to a buffer with a timestamp in a temporary timequeue buffer.
   This function is added to after-change-functions"
@@ -580,25 +639,30 @@ Default CSD - A CSD to run when Csound starts
 	 (text (buffer-substring beg end))
 	 (tlen (length text))
 	 (pt beg)
-	 (buf (buffer-name)))
-    (setq text (replace-regexp-in-string "[\n$]" "^J" text))
-    (setq text (replace-regexp-in-string "|" "\vert" text))
-    (when (= tlen 0) (setq text "\b") (setq tlen (* len -1)))
-    ;; (if *RECORD-INSERT-OFFSETS* (record-playback-offset pt tlen))
-    (save-current-buffer
-      (set-buffer (get-buffer-create (concat "*" (buffer-name) "-TIMEQUEUE*")))
-      (insert (format "%s " time) "|" text "|" (format "%s|%s|%s\n" pt len buf)))))
+	 (bufname (if (string-suffix-p "-InDir" (buffer-name))
+		      (buffer-name (buffer-base-buffer))
+		    (buffer-name))))
+    (when (cslc--ac-filter text tlen pt end len)
+      (setq text (replace-regexp-in-string "[\n$]" "^J" text))
+      (setq text (replace-regexp-in-string "|" "\vert" text))
+      (when (= tlen 0)
+	(setq text "\b") (setq tlen (* len -1)))
+      (save-current-buffer
+	(set-buffer (get-buffer-create (concat "*" bufname "-TIMEQUEUE*")))
+	(insert (format "%s " time) "|" text "|" (format "%s|%s|%s\n" pt len bufname))))))
+
 
 (defun cslc--record-evaluation (funcname &rest args)
   "Records an evaluation event with timestamp in a temporary timequeue"
   (let ((time (time-since cslc--record-start-time))
 	(action (format "ELISP:%S#%S" funcname args))
 	(pt (point))
-	(buf (buffer-name)))
+	(bufname (if (string-suffix-p "-InDir" (buffer-name)) (buffer-name (buffer-base-buffer)) (buffer-name))))
+    ;;(message "CALLED Record-Eval in %s, writing to %s" (buffer-name) (concat "*" bufname "-TIMEQUEUE*"))
     (save-current-buffer
-      (set-buffer (get-buffer-create (concat "*" (buffer-name) "-TIMEQUEUE*")))
+      (set-buffer (get-buffer-create (concat "*" bufname "-TIMEQUEUE*")))
       (insert (format "%s " time) "|" action "|" 
-	      (format "%s|%s|%s\n" pt 0 buf)))))
+	      (format "%s|%s|%s\n" pt 0 bufname)))))
 
 (defun cslc--record-mode-change (modename)
   "records a change of mode event in a timequeue"
@@ -688,20 +752,23 @@ Default CSD - A CSD to run when Csound starts
 			(funcall (intern modename)))))		    
 		  (unless (boundp '*OFFSET-HEAP*)
 		    (message "creating *OFFSET-HEAP* in %s" (buffer-name))
-		    (setq-local *OFFSET-HEAP* (make-heap '< 5000))))		  
+		    (setq-local *OFFSET-HEAP* (make-heap '< 5000)))
+		  (unless (boundp 'cslc--olay-tlen)
+		    (message "creating cslc--olay-tlen in buffer %s" (buffer-name))
+		    (setq-local cslc--olay-tlen 0)))
 		(with-current-buffer destbuf
 		  (when (string-prefix-p "MODE:" action)
 		    (let ((modename (substring action 5)))
 		      (unless (string= major-mode modename)
 			(funcall (intern modename)))))
 		  (goto-char (point-min))
+		  (message "HOOK: placing cslc--record-buffer-offsets in %s" destbuf)
 		  (add-hook 'after-change-functions 'cslc--record-buffer-offsets nil t))
 		(push tqbufname bufnames)
 		(push destinationbufname destnames))))
 	  (forward-line))))
     (when (eq (count-windows) 1)
       (cslc--display-performance-buffers destnames))))
-
 
 
 (defun cslc-play-recording ()
@@ -723,18 +790,18 @@ Default CSD - A CSD to run when Csound starts
   "Pause the playback of the timequeue recording."
   (interactive)
   (setq cslc--performance-start-time nil)
-  (toggle-pause-csd-clock)
+  ;;(toggle-pause-csd-clock)
   (with-current-buffer *TIMEQUEUE*
     (beginning-of-line)
     (setq cslc--timequeue-point (point)))
-  (message "%s &s" "Exiting cslc-pause-playback" cslc--timequeue-point)
+  (message "%s %s" "Exiting cslc-pause-playback" cslc--timequeue-point)
   (setq cslc--recordingflag "Paused Performance"))
 
 (defun cslc-resume-playback ()
   "Resume the performance of the timequeue recording."
   (interactive)
   (setq cslc--recordingflag "Resumed Performance Playback")  
-  (toggle-pause-csd-clock)
+  ;;(toggle-pause-csd-clock)
   (if (zerop (buffer-size *TIMEQUEUE*))
       (progn
 	(message "%s" "*TIMEQUEUE* EMPTY - setting PST to now")
@@ -753,6 +820,9 @@ Default CSD - A CSD to run when Csound starts
       (message "Already recording in %s" (buffer-name))
     ;;(stopwatch-start)
     (cslc-create-performance-buffers)
+    (unless (boundp 'cslc--olay-tlen)
+      (message "cslc-start-recording creating cslc--olay-tlen in buffer %s" (buffer-name))
+      (setq-local cslc--olay-tlen 0))
     (unless cslc--performance-start-time
       (setq cslc--performance-start-time (current-time))
       (cslc--perform-timequeue))
@@ -762,12 +832,22 @@ Default CSD - A CSD to run when Csound starts
     (cslc--record-mode-change (format "%s" major-mode))
     (unless (zerop (buffer-size))
       (cslc--record-existing-buffer-contents))
-    (add-hook 'after-change-functions
-	      'cslc--record-every-buffer-mod nil t)
-    (setq cslc--recording-buffer-count (+ cslc--recording-buffer-count 1))
-    (message "RECORDING BEGUN IN %s" (buffer-name)
-    (setq cslc--recordingflag "Recording Begun"))))
+    ;;put this hook in the indirect buffer
+    ;;but record in the same timequeue buffer
+    (with-current-buffer (cslc--get-indirect-buffer-create (buffer-name))
+      (message "adding 'cslc--record-every-buffer-mod to %s" (buffer-name))
+      (add-hook 'after-change-functions
+		'cslc--record-every-buffer-mod nil t))
+    ;; and this as well?
+    (with-current-buffer (get-buffer-create (buffer-name))
+      (message "adding 'cslc--record-every-buffer-mod to %s" (buffer-name))
+      (add-hook 'after-change-functions
+    		'cslc--record-every-buffer-mod nil t))
+    (setq cslc--recording-buffer-count (+ cslc--recording-buffer-count 1))    
+    (message "RECORDING BEGUN IN %s" (buffer-name))
+    (setq cslc--recordingflag "Recording Begun")))
 
+    
 (defun cslc-toggle-pause-recording ()
   "Toggle on/off recording of buffer changes"
   (interactive)
