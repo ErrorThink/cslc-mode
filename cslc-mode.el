@@ -161,6 +161,16 @@ Note that these over-ride csd flags"
   :group 'cslc
   :type 'list)
 
+(defun timep (timelist)
+  "test if list is in a time format"
+  (when (and (listp timelist)
+	     (= (length timelist) 4)
+	     (numberp (car timelist))
+	     (numberp (cadr timelist))
+	     (numberp (caddr timelist))
+	     (numberp (cadddr timelist)))
+    t))
+
 (defun cslc-next-instrument ()
   "Move cursor to the next instrument after the current point in the buffer"
   (interactive)
@@ -389,7 +399,7 @@ Default CSD - A CSD to run when Csound starts
 	     (event-str (string-to-unibyte (buffer-substring-no-properties beg endln))))
 	(if (or (> point-now endln) (< point-now beg))
 	    (message "No code to evaluate")
-	  (process-send-string cslc--csound-process event-str)      
+	  (process-send-string cslc--csound-process event-str)
 	  ;(when *CSDOUTPUT* (csound-write-csd-output event-str))
 	  (message (thing-at-point 'line))
 	  (pulse-momentary-highlight-region beg endln 'highlight))))))
@@ -400,18 +410,19 @@ Default CSD - A CSD to run when Csound starts
   (if cslc--recording (cslc--record-evaluation 'cslc-eval-line))
   (save-excursion
     (let ((scline (string-to-unibyte (thing-at-point 'line))))
-      (process-send-string cslc--csound-process scline)
+      (process-send-string cslc--csound-process scline)      
       ;(when *CSDOUTPUT* (csound-write-csd-output scline))
       (message (thing-at-point 'line))
       (pulse-momentary-highlight-region (line-beginning-position) (line-end-position) 'highlight))))
 
-(defun cslc-eval-region ()
+
+(defun cslc-eval-region (&optional regbeg regend)
   "send a region of text to csound for evaluation"
   (interactive)
-  (if cslc--recording (cslc--record-evaluation 'cslc-eval-region))
   (save-excursion
-    (let ((beg (region-beginning))
-	  (end (region-end)))
+    (let ((beg (if regbeg regbeg (region-beginning)))
+	  (end (if regend regend (region-end))))
+      (if cslc--recording (cslc--record-evaluation 'cslc-eval-region beg end))
       (let ((event-str (string-to-unibyte (buffer-substring-no-properties beg end))))
 	(process-send-string cslc--csound-process event-str)
 	;(when *CSDOUTPUT* (csound-write-csd-output event-str))
@@ -439,24 +450,12 @@ Default CSD - A CSD to run when Csound starts
 ;PERFORMING
 ;==================================================
 
-(defun cslc--play-eval (s)
-  "evaluate the item in timequeue"
-  (let ((lsted (split-string (substring s 6) "#")))
-    (when (and (string-suffix-p "-InDir" (buffer-name)) (buffer-local-value 'cslc--recording (buffer-base-buffer)))
-      (let ((time (time-since cslc--record-start-time))
-	    (action s)	    
-	    (pt (point))
-	    (bfr (buffer-base-buffer)))
-	(with-current-buffer (get-buffer-create (concat "*" (buffer-name bfr) "-TIMEQUEUE*"))
-	  (insert (format "%s " time) "|" action "|" 
-		  (format "%s|%s|%s\n" pt 0 (buffer-name bfr))))))    
-    (apply (read lsted) (read (cadr lsted)))))
-
 (defun cslc--string-reverse (str)
       "Reverse the str where str is a string"
       (apply #'string 
 	     (reverse 
 	      (string-to-list str))))
+
 
 (defun cslc--perfbuffer-name (bfname)
   "Returns a string to be used as a buffer name. Increments the 'Take' number, if a previous version of the buffer has been recorded."
@@ -467,10 +466,7 @@ Default CSD - A CSD to run when Csound starts
     (if ispriortake
 	(concat (substring bufname-fixed 0 (- (length bufname-fixed)
 					      (- (length (number-to-string endbit)) 4))) suffix-num)
-      (concat bufname-fixed "-Take" suffix-num)
-      )
-    )
-  )
+      (concat bufname-fixed "-Take" suffix-num))))
 
 ;creates an indirect buffer. Playback happens in the indirect buffer. 
 (defun cslc--get-indirect-buffer-create (basename)
@@ -560,6 +556,22 @@ Default CSD - A CSD to run when Csound starts
     (dolist (listoff resultlist)
       (heap-modify *OFFSET-HEAP* `(lambda(n)(= n ,listoff))
 		   (+ listoff (* tlen (signum listoff)))))))
+
+(defun cslc--play-eval (s)
+  "evaluate the item in timequeue"
+  (let ((lsted (split-string (substring s 6) "#")))
+    (when (and (string-suffix-p "-InDir" (buffer-name)) (buffer-local-value 'cslc--recording (buffer-base-buffer)))
+      (let ((time (time-since cslc--record-start-time))
+	    (action s)	    
+	    (pt (point))
+	    (bfr (buffer-base-buffer)))
+	(with-current-buffer (get-buffer-create (concat "*" (buffer-name bfr) "-TIMEQUEUE*"))
+	  (insert (format "%s " time) "|" action "|" 
+		  (format "%s|%s|%s\n" pt 0 (buffer-name bfr))))))
+    (let ((apparg1 (read lsted))
+	  (apparg2 (read (cadr lsted))))
+      (apply apparg1 (mapcar '(lambda (regpt) (+ regpt (cslc--calc-offset regpt))) apparg2)))))
+
 
 (defun cslc--pollaction (&optional nowtime)
   "Playback the recorded *TIMEQUEUE* performance"
@@ -933,10 +945,9 @@ Default CSD - A CSD to run when Csound starts
 	      (kill-whole-line)
 	    (setq moreLines (= (forward-line 1) 0))))))))
 
-
-(defun cslc-timeshift-recorded-session (secs &optional name)
+(defun cslc-timeshift-recorded-session (name secs)
   "Shift timestamps of a buffer recording by n seconds"
-  (interactive "sBuffer name? (default is current buffer):")
+  (interactive "sBuffer name? (default is current buffer): \nnShift in seconds?: ")
   (let ((bufname (if (= (string-width name) 0)
 		     (concat (buffer-name (current-buffer))"\n")
 		   (concat name "\n")))
@@ -946,12 +957,15 @@ Default CSD - A CSD to run when Csound starts
 	(goto-char 1)
 	(while moreLines
 	  (beginning-of-line)
-	  (if (string-suffix-p bufname (thing-at-point 'line))
-	      (let ((newtime (time-add (seconds-to-time secs) (list-at-point)))
-		    (timebounds (bounds-of-thing-at-point 'list)))
-	        (delete-region (car timebounds) (cdr timebounds))
-		(insert (format "%s" newtime))
-		))
+	  (when (string-suffix-p bufname (thing-at-point 'line))
+	    (let ((time-bounds (bounds-of-thing-at-point 'sexp)))
+	      (when time-bounds
+		(let ((recorded-time (read (buffer-substring (car time-bounds) (cdr time-bounds)))))
+		  (if (timep recorded-time)
+		      (let ((newtime (time-add (seconds-to-time secs) recorded-time)))		    
+			(delete-region (car time-bounds) (cdr time-bounds))
+			(insert (format "%s" newtime)))
+		    (message "***timep nil ln:%s time:%s" (line-number-at-pos) recorded-time))))))	  
 	  (setq moreLines (= (forward-line 1) 0)))))))
 
   
