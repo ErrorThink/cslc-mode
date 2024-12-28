@@ -5,7 +5,7 @@
 ;; Author: Thorin Kerr <thorin.kerr@gmail.com>
 ;; Keywords: livecoding live-coding csound
 ;; Compatibility: GNU Emacs 25.2.2
-;; Version: 0.2
+;; Version: 0.3
  
 ;; This file is NOT part of GNU Emacs
 
@@ -197,6 +197,140 @@ Note that these over-ride csd flags"
 (defvar cslc--csd-clock (current-time))
 ;; More relevant when CSD-output is implemented
 
+(defvar cslc--csd-output nil)
+(defvar cslc--nested-string-cnt 300000)
+(defvar cslc--nested-strings '())
+(defvar cslc--pause-csd-clock nil)
+
+
+;;;;;;;; Some helper functions
+
+(defun add-to-alist (lst-symbol pair &optional unique)
+  (add-to-list lst-symbol pair nil (when unique (lambda (p y) (equal (car p) (car y))))))
+
+(defun path-wsl (path)
+  (let ((drive-letter (downcase (substring-no-properties path 0 1))))
+    (concat "/mnt/" drive-letter (replace-regexp-in-string "\\\\" "/" (substring path 2)))))
+
+(defun cslc--write-soundlib (outfile)
+  (with-temp-buffer
+    (let ((cslc-path (if (and (getenv "WSL_DISTRO_NAME")
+			      (not (string-prefix-p "/" cslc-init-csd)))
+			 (path-wsl cslc-init-csd)
+		       cslc-init-csd)))
+      (insert-file-contents cslc-path)
+      (goto-char (point-min))
+      (let* ((soundlibname (when (ignore-errors (search-forward "--omacro:SOUNDLIB="))
+			     (thing-at-point 'filename 'no-properties)))
+	     (soundlibcopy (concat (file-name-sans-extension outfile) "-" soundlibname)))
+	(with-temp-file soundlibcopy
+	  (insert-file-contents (concat (file-name-directory cslc-path) soundlibname)))
+	(file-name-nondirectory soundlibcopy)))))
+
+(defun cslc--write-include (filename)
+  (with-temp-buffer
+    (if (and (getenv "WSL_DISTRO_NAME") (not (string-prefix-p "/" cslc-init-csd)))      
+	(insert-file-contents (path-wsl cslc-init-csd))
+      (insert-file-contents cslc-init-csd))
+    (let ((incname (concat (file-name-sans-extension filename) ".inc")))
+      (goto-char (point-min))
+      (delete-region 1 (search-forward "<CsInstruments>"))
+      (goto-char (point-max))
+      (delete-region (search-backward "</CsInstruments>") (point-max))
+      (write-region nil nil incname)
+      (file-name-nondirectory incname))))
+
+
+(defun cslc-csd-output ()
+  (interactive)
+  (if (not cslc--csd-output)
+      (progn
+	(setq cslc--csd-output (get-buffer-create "*CSDPerformance*"))
+	     (message "BEGINNING CSD OUTPUT"))
+    (message "FINISHING CSD OUTPUT")
+    (let* ((outfile (read-file-name "CSD output: "))	   
+	   (soundlib (cslc--write-soundlib outfile))
+	   (incname (cslc--write-include outfile)))
+      (with-current-buffer cslc--csd-output
+	(message "incname = %s" incname)
+	(cslc-insert-fileout-csd-tags incname soundlib) ; change the csound include outfile.inc
+	(write-region nil nil outfile))
+      (setq cslc--csd-output nil)
+      (setq cslc--csd-clock nil)
+      (setq cslc--nested-strings '())
+      (setq cslc--nested-string-cnt 0))))
+
+
+
+(defun cslc--substitute-nested-strings (str)
+  (let ((posn -1)
+	(leftpos nil)
+	(rightpos nil)
+	(strgetresult str)
+	(strsetresult ""))
+    (seq-do (lambda (c)
+	      (setq posn (1+ posn))
+	      (if (char-equal c 34)
+		  (cond ((not leftpos) (setq leftpos posn))
+			((not rightpos) (setq rightpos posn))
+			(t (message "shouldn't be here\n"))))
+	      (if (and leftpos rightpos)
+		  (let ((slifted (substring str leftpos (1+ rightpos))))
+		    (setq leftpos nil)
+		    (setq rightpos nil)
+		    (unless (assoc slifted cslc--nested-strings)
+		      (message "adding a new nested string : %s \n" slifted)
+		      (setq cslc--nested-string-cnt (1+ cslc--nested-string-cnt))
+		      (add-to-alist 'cslc--nested-strings (cons slifted cslc--nested-string-cnt))
+		      (setq strsetresult (concat strsetresult (concat "strset " (number-to-string cslc--nested-string-cnt) ", " slifted "\n")))
+		      ))))
+	    str)
+    (dolist (sp cslc--nested-strings)
+      (let ((strnum (number-to-string (cdr sp)))
+	    (srep (car sp)))
+        (setq strgetresult
+    	      (replace-regexp-in-string srep
+    				      (concat "strget(" strnum ")")
+    				      strgetresult
+				      t t))))
+    (cons strsetresult strgetresult)))
+
+
+(defun cslc--write-csd-output (event-str)
+  (interactive)
+  (unless cslc--csd-clock (setq cslc--csd-clock (current-time)))
+  (let* ((tm (number-to-string (float-time (time-since cslc--csd-clock))))
+	 (nested-sub (cslc--substitute-nested-strings event-str))
+	 (strsetters (car nested-sub))
+	 (strgetters (cdr nested-sub))
+	 (bodynum (number-to-string (setq cslc--nested-string-cnt (1+ cslc--nested-string-cnt))))
+	 (bodyset-str (concat "strset, " bodynum ", {{\n" strgetters "\n}}\n"))
+	 (sched-str (concat "schedule 8, " tm ", 1, " bodynum "\n")))
+    (with-current-buffer cslc--csd-output
+      (goto-char (point-min))
+      (insert strsetters)
+      (insert bodyset-str)
+      (goto-char (point-max))
+      (insert sched-str))
+    )
+  )
+
+
+(defun cslc--toggle-pause-csd-clock ()
+  (interactive)
+  (if (not cslc--pause-csd-clock)
+      (progn (setq cslc--pause-csd-clock (current-time))
+	     (setq cslc--csd-output nil)
+	     (message "Pausing CSD Write"))
+    (setq cslc--csd-output (get-buffer-create "*CSDPerformance*"))
+    (setq cslc--csd-clock (time-add cslc--csd-clock (time-since cslc--pause-csd-clock)))
+    (setq cslc--pause-csd-clock nil)
+    (message "Resuming CSD Write")))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+
 (defvar cslc--icount nil)
 (setq cslc--icount 100)
 
@@ -284,18 +418,26 @@ endif"))
 </CsInstruments>
 </CsoundSynthesizer>"))
 
-(defun cslc-insert-fileout-csd-tags ()
+(defun cslc-insert-fileout-csd-tags (&optional incname soundlib)
   "Insert csd tags in the buffer for audio file output"
   (interactive)
   (let ((end-time (number-to-string (float-time (time-since cslc--csd-clock)))))
+    (unless incname (setq incname "cslc.inc"))
+    (unless soundlib (setq soundlib "Sounds.orc"))
     (goto-char (point-min))
-    (insert "<CsoundSynthesizer>
+    (insert
+     (concat
+      (format "<CsoundSynthesizer>
 <CsOptions>
--oCSPerformance.wav --nchnls=2 --0dbfs=1 --nodisplays --sample-rate=48000 --ksmps=10 --sample-accurate --messagelevel=70
+-o%s --nchnls=2 --0dbfs=1 --nodisplays --sample-rate=48000 --ksmps=10 --sample-accurate --messagelevel=70
 </CsOptions>
 <CsInstruments>
-#include \"SetupLib.inc\"
-#include \"Sounds.orc\"\n")
+" (concat (file-name-sans-extension incname) ".wav"))      
+      (format "#include \"%s\" 
+" incname)
+      (format "#include \"%s\" 
+" soundlib)
+      ))
     (goto-char (point-max))
     (insert (concat "\nschedule 7, " end-time ", 1\n" "</CsInstruments>\n<CsScore>\nf0 "
 		    end-time "\ne\n</CsScore>\n</CsoundSynthesizer>\n"))))
@@ -315,7 +457,6 @@ endif"))
 (defun wsl-file-name-nondirectory (path)
   (file-name-nondirectory (if (string-prefix-p "/" path) path 
 			    (replace-regexp-in-string "\\\\" "/" path))))
-
 
 (defun cslc-settings (csdname host port cmd)
   "Prompt interface to edit and save settings.
@@ -400,7 +541,7 @@ Default CSD - A CSD to run when Csound starts
 	(if (or (> point-now endln) (< point-now beg))
 	    (message "No code to evaluate")
 	  (process-send-string cslc--csound-process event-str)
-	  ;(when *CSDOUTPUT* (csound-write-csd-output event-str))
+	  (when cslc--csd-output (cslc--write-csd-output event-str))
 	  (message (thing-at-point 'line))
 	  (pulse-momentary-highlight-region beg endln 'highlight))))))
 
@@ -411,7 +552,7 @@ Default CSD - A CSD to run when Csound starts
   (save-excursion
     (let ((scline (string-to-unibyte (thing-at-point 'line))))
       (process-send-string cslc--csound-process scline)      
-      ;(when *CSDOUTPUT* (csound-write-csd-output scline))
+      (when cslc--csd-output (cslc--write-csd-output scline))
       (message (thing-at-point 'line))
       (pulse-momentary-highlight-region (line-beginning-position) (line-end-position) 'highlight))))
 
@@ -425,7 +566,7 @@ Default CSD - A CSD to run when Csound starts
       (if cslc--recording (cslc--record-evaluation 'cslc-eval-region beg end))
       (let ((event-str (string-to-unibyte (buffer-substring-no-properties beg end))))
 	(process-send-string cslc--csound-process event-str)
-	;(when *CSDOUTPUT* (csound-write-csd-output event-str))
+	(when cslc--csd-output (cslc--write-csd-output event-str))
 	(message (thing-at-point 'line))
 	(pulse-momentary-highlight-region beg end 'highlight)))))
 
@@ -802,7 +943,7 @@ Default CSD - A CSD to run when Csound starts
   "Pause the playback of the timequeue recording."
   (interactive)
   (setq cslc--performance-start-time nil)
-  ;;(toggle-pause-csd-clock)
+  (cslc--toggle-pause-csd-clock)
   (with-current-buffer *TIMEQUEUE*
     (beginning-of-line)
     (setq cslc--timequeue-point (point)))
@@ -813,7 +954,7 @@ Default CSD - A CSD to run when Csound starts
   "Resume the performance of the timequeue recording."
   (interactive)
   (setq cslc--recordingflag "Resumed Performance Playback")  
-  ;;(toggle-pause-csd-clock)
+  (cslc--toggle-pause-csd-clock)
   (if (zerop (buffer-size *TIMEQUEUE*))
       (progn
 	(message "%s" "*TIMEQUEUE* EMPTY - setting PST to now")
@@ -865,12 +1006,14 @@ Default CSD - A CSD to run when Csound starts
   (interactive)
   (if (not cslc--pause-recording-clock)
       (progn
+        (cslc-pause-playback)
 	(setq cslc--pause-recording-clock (current-time))
 	(dolist (bfr (buffer-list))
 	  (with-current-buffer bfr
 	    (when cslc--recording
 	      (remove-hook 'after-change-functions 'cslc--record-every-buffer-mod t)
 	      (message "RECORDING PAUSED IN %s" (buffer-name))))))
+    (cslc-resume-playback)
     (setq cslc--record-start-time (time-add cslc--record-start-time (time-since cslc--pause-recording-clock)))
     (dolist (bfr (buffer-list))
       (with-current-buffer bfr
