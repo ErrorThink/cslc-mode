@@ -1,11 +1,11 @@
 ;;; cslc-mode.el --- Minor mode for recording live code sessions with Csound. -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2024, Thorin Kerr
+;; Copyright (C) 2025, Thorin Kerr
 
 ;; Author: Thorin Kerr <thorin.kerr@gmail.com>
 ;; Keywords: livecoding live-coding csound
 ;; Compatibility: GNU Emacs 25.2.2
-;; Version: 0.3
+;; Version: 0.4
  
 ;; This file is NOT part of GNU Emacs
 
@@ -25,16 +25,18 @@
 ;; Package-Requires: ((heap "0.5"))
 
 ;;; Commentary:
-;; This package provides functions which send code
+;; This package provides functions which send code (via UDP)
 ;; to an instance of Csound running in an external terminal.
-;; Additional features Record and play back the 'typed' live code sessions 
-;; from multiple buffers.
+;; Additional features include:
+;; 'Multi-track' Recording and play back of performed ('typed') live code sessions. 
+;; save Csound CSD files of a performance.
 
 ;; FEATURES
 ;; --------------
 ;; - Launch a terminal running Csound (default ANSI-TERM)
-;; - Set a default CSD to run with csound
+;; - Set a default CSD to run with csound (useful for library code and instruments)
 ;; - Record/playback and re-record multiple live code sessions in multiple buffers.
+;; - Save CSound CSD output of a performance.
 ;; - Edit code within the same buffer as playback (experimental).
 
 ;; Getting Started
@@ -52,9 +54,10 @@
 ;; will increment a numbered suffix in the buffer name with '-Take[n]'.
 ;; When finishing a new 'Take' you may then want to delete the previous Take from *TIMEQUEUE*
 ;; (M-x cslc-remove-recorded-session <buffer-to-remove>)
-;;
+;; 7. Replay the performance with (M-x cslc-play-recording)
+
 ;; Performance Recordings are stored in the file ~/*TIMEQUEUE*.
-;; Rename and save this file for posterity. 
+;; Rename and save this file for posterity.
 ;;
 ;; Default keybindings (Re-bind these to something more convenient)
 ;; C-c & `cslc-start-process' launches a process and a terminal running csound. 
@@ -77,6 +80,7 @@
 ;; `cslc-create-performance-buffers' - Creates the buffers recorded in *TIMEQUEUE* without beginning the performance.
 ;; `cslc-pause-playback' - Pause the playback of a recording.
 ;; `cslc-resume-playback' - Resume the playback of a paused recording.
+;; `cslc-toggle-pause-playback' - Pause / Resume playback of a recorded session.
 ;; `cslc-toggle-pause-recording' - Pause / Resume playback of a recording.
 ;; `cslc-remove-recorded-session' - Prompt to remove a recorded session of a buffer from *TIMEQUEUE*.     
 ;; `cslc-timeshift-recorded-session' - Shift timestamps of a recorded buffer session by n seconds.
@@ -84,6 +88,7 @@
 ;; `cslc-increment-buffer-playback-speed' - increase the playback speed.
 ;; `cslc-increment-buffer-playback-speed' - decrease the playback speed.
 ;; `cslc-original-buffer-playback-speed' - return to normal playback speed
+;; `clsc-gloss' - Record an annotation in a timequeue. Has no effect of performance.
 ;;  ---- For use with cslc-lib.csd as a default csd (optional):
 ;; `cslc-new-scheduler' - insert a template for a tempo recursion instrument
 ;; `cslc-new-instr' - insert a template for a a source instrument
@@ -115,8 +120,9 @@
 ;;
 ;;
 ;; To DO
-;; CSD output of a performance
-;; Advice online suggests find-file-noselect is problematic. Replace this.
+;; Fix experimental code that allows live editing within the same buffer replaying a performed session.
+;; This sometimes works on small edits, but larger edits mess up insertion positions during playback.
+;;
 ;;; Code:
 
 ;;Public Interface Functions ;;;;;;;;;;;;;;;;;;;;;;;
@@ -240,13 +246,13 @@ Note that these over-ride csd flags"
       (write-region nil nil incname)
       (file-name-nondirectory incname))))
 
-
 (defun cslc-csd-output ()
   (interactive)
   (if (not cslc--csd-output)
       (progn
 	(setq cslc--csd-output (get-buffer-create "*CSDPerformance*"))
-	     (message "BEGINNING CSD OUTPUT"))
+	(setq cslc--csd-clock (current-time))
+	(message "BEGINNING CSD OUTPUT"))
     (message "FINISHING CSD OUTPUT")
     (let* ((outfile (read-file-name "CSD output: "))	   
 	   (soundlib (cslc--write-soundlib outfile))
@@ -260,40 +266,6 @@ Note that these over-ride csd flags"
       (setq cslc--nested-strings '())
       (setq cslc--nested-string-cnt 0))))
 
-
-
-(defun cslc--substitute-nested-strings (str)
-  (let ((posn -1)
-	(leftpos nil)
-	(rightpos nil)
-	(strgetresult str)
-	(strsetresult ""))
-    (seq-do (lambda (c)
-	      (setq posn (1+ posn))
-	      (if (char-equal c 34)
-		  (cond ((not leftpos) (setq leftpos posn))
-			((not rightpos) (setq rightpos posn))
-			(t (message "shouldn't be here\n"))))
-	      (if (and leftpos rightpos)
-		  (let ((slifted (substring str leftpos (1+ rightpos))))
-		    (setq leftpos nil)
-		    (setq rightpos nil)
-		    (unless (assoc slifted cslc--nested-strings)
-		      (message "adding a new nested string : %s \n" slifted)
-		      (setq cslc--nested-string-cnt (1+ cslc--nested-string-cnt))
-		      (add-to-alist 'cslc--nested-strings (cons slifted cslc--nested-string-cnt))
-		      (setq strsetresult (concat strsetresult (concat "strset " (number-to-string cslc--nested-string-cnt) ", " slifted "\n")))
-		      ))))
-	    str)
-    (dolist (sp cslc--nested-strings)
-      (let ((strnum (number-to-string (cdr sp)))
-	    (srep (car sp)))
-        (setq strgetresult
-    	      (replace-regexp-in-string srep
-    				      (concat "strget(" strnum ")")
-    				      strgetresult
-				      t t))))
-    (cons strsetresult strgetresult)))
 
 
 (defun cslc--write-csd-output (event-str)
@@ -311,10 +283,44 @@ Note that these over-ride csd flags"
       (insert strsetters)
       (insert bodyset-str)
       (goto-char (point-max))
-      (insert sched-str))
-    )
-  )
+      (insert sched-str))))
 
+(defun cslc--substitute-nested-strings (str)
+  (let ((sanscurl (replace-regexp-in-string "}}" "\\175\\175" (replace-regexp-in-string "{{" "\\173\\173" str t t) t t)))
+    (let ((posn -1)
+	  (leftpos nil)
+	  (rightpos nil)
+	  (doublec 0)
+	  (strgetresult sanscurl)
+	  (strsetresult ""))
+      (seq-do (lambda (c)
+		(setq posn (1+ posn))
+		(if (char-equal c 34)
+		    (cond ((not leftpos) (setq leftpos posn))
+			  ((not rightpos) (setq rightpos posn))
+			  (t (message "shouldn't be here\n"))))
+		(if (and leftpos rightpos)
+		    (let ((slifted (substring sanscurl leftpos (1+ rightpos))))
+		      (message "slifted = %s" slifted)
+		      (setq leftpos nil)
+		      (setq rightpos nil)
+		      (unless (assoc slifted cslc--nested-strings)
+			(message "adding a new nested string : %s \n" slifted)
+			(setq cslc--nested-string-cnt (1+ cslc--nested-string-cnt))
+			(add-to-alist 'cslc--nested-strings (cons slifted cslc--nested-string-cnt))
+			(setq strsetresult (concat strsetresult (concat "strset " (number-to-string cslc--nested-string-cnt) ", " slifted "\n")))
+			))))
+	      sanscurl)
+      (dolist (sp cslc--nested-strings)
+	(let ((strnum (number-to-string (cdr sp)))
+	      (srep (car sp)))
+	  (message "srep = %s strgetresult = %s" srep strgetresult)
+	  (setq strgetresult
+		(replace-regexp-in-string srep
+					  (concat "strget(" strnum ")")
+					  strgetresult
+					  t t))))
+      (cons strsetresult strgetresult))))
 
 (defun cslc--toggle-pause-csd-clock ()
   (interactive)
@@ -662,12 +668,12 @@ Default CSD - A CSD to run when Csound starts
 	 (last -1)
 	 (delcount-at-pt 0))
      (iter-do (offpt ohiter)
-       (cond ((and (= (signum offpt) -1) (< (abs offpt) pt))
+       (cond ((and (= (cl-signum offpt) -1) (< (abs offpt) pt))
 	      (setq tally (1- tally)))
-	     ((and (= (signum offpt) -1) (= (abs offpt) pt))
+	     ((and (= (cl-signum offpt) -1) (= (abs offpt) pt))
 	      (setq tally (1- tally))
 	      (setq delcount-at-pt (1+ delcount-at-pt)))
-	     ((and (= (signum offpt) -1) (> (abs offpt) pt))
+	     ((and (= (cl-signum offpt) -1) (> (abs offpt) pt))
 	      nil)
 	     ((and (< offpt pt))
 	      (setq tally (1+ tally)))
@@ -696,7 +702,7 @@ Default CSD - A CSD to run when Csound starts
     (setq resultlist (sort resultlist pred))
     (dolist (listoff resultlist)
       (heap-modify *OFFSET-HEAP* `(lambda(n)(= n ,listoff))
-		   (+ listoff (* tlen (signum listoff)))))))
+		   (+ listoff (* tlen (cl-signum listoff)))))))
 
 (defun cslc--play-eval (s)
   "evaluate the item in timequeue"
@@ -713,7 +719,6 @@ Default CSD - A CSD to run when Csound starts
 	  (apparg2 (read (cadr lsted))))
       (apply apparg1 (mapcar '(lambda (regpt) (+ regpt (cslc--calc-offset regpt))) apparg2)))))
 
-
 (defun cslc--pollaction (&optional nowtime)
   "Playback the recorded *TIMEQUEUE* performance"
   (when cslc--performance-start-time
@@ -723,31 +728,32 @@ Default CSD - A CSD to run when Csound starts
 					       (replace-regexp-in-string "\vert" "|" (elt event 1))))
 	     (pt (string-to-number (elt event 2)))
 	     (len (string-to-number (elt event 3)))
-	     (destinationbuf (cslc--perfbuffer-name (elt event 4)))
-	     (indirectbuf (cslc--get-indirect-buffer-create destinationbuf))
 	     (now (if nowtime nowtime 0.0))
 	     (next-time (progn (forward-line 1)
 			       (if (eobp) nil (read (thing-at-point 'line))))))
-	(with-current-buffer indirectbuf
-	  (let ((pto (+ pt (cslc--calc-offset pt))))
-	    ;;(message "pt|pto|diff ========== %s | %s | %s" pt pto (- pto pt))
-	    (save-excursion
-	      (if (< (point-max) pto) (goto-char (point-max)) (goto-char pto))
-	      (cond ((not cslc--performance-start-time) (setq next-time nil))
-		    ((string-prefix-p "MODE:" action)
-		     (let ((mm (substring action 5)))
-		       (if (not (string= major-mode mm)) 
-			   (funcall (intern (substring action 5))))))
-		    ((string= action "\b")
-		     (delete-region pto (+ pto len))
-		     (cslc--shift-offsets (+ pto len) (- len) '>=)
-		     )
-		    ((string-prefix-p "ELISP:" action) (cslc--play-eval action))
-		    ;;((> len 0) (message "pollaction - shouldn't be here"))
-		    (t
-		     (insert action)
-		     (cslc--shift-offsets pto (length action) '>=)
-		     )))))
+	(if (string-prefix-p "GLOSS:" action) (message "GLOSS: %s" action)
+	  (let* ((destinationbuf (cslc--perfbuffer-name (elt event 4)))
+		 (indirectbuf (cslc--get-indirect-buffer-create destinationbuf)))
+	    (with-current-buffer indirectbuf
+	      (let ((pto (+ pt (cslc--calc-offset pt))))
+		;;(message "pt|pto|diff ========== %s | %s | %s" pt pto (- pto pt))
+		(save-excursion
+		  (if (< (point-max) pto) (goto-char (point-max)) (goto-char pto))
+		  (cond ((not cslc--performance-start-time) (setq next-time nil))
+			((string-prefix-p "MODE:" action)
+			 (let ((mm (substring action 5)))
+			   (if (not (string= major-mode mm)) 
+			       (funcall (intern (substring action 5))))))
+			((string= action "\b")
+			 (delete-region pto (+ pto len))
+			 (cslc--shift-offsets (+ pto len) (- len) '>=)
+			 )
+			((string-prefix-p "ELISP:" action) (cslc--play-eval action))
+			;;((> len 0) (message "pollaction - shouldn't be here"))
+			(t
+			 (insert action)
+			 (cslc--shift-offsets pto (length action) '>=)
+			 )))))))	
 	(if next-time
 	    (let* ((nt (float-time next-time))
 		   (calctime (/ (- nt now) cslc--speed)))
@@ -828,6 +834,17 @@ Default CSD - A CSD to run when Csound starts
       (insert (format "%s " time) "|" action "|" 
 	      (format "%s|%s|%s\n" pt 0 buf)))))
 
+(defun cslc-gloss (&optional note)
+  "Record an annotation in a timequeue. Has no effect of performance"
+  (interactive "sNote:")
+  (let* ((time (time-since cslc--performance-start-time))
+	(action (concat "GLOSS:" note))
+	(pt (point))
+	(buf (buffer-name))
+	(destbuf (get-buffer (concat "*" (buffer-name) "-TIMEQUEUE*"))))
+    (with-current-buffer (if destbuf destbuf (get-buffer *TIMEQUEUE*))
+      (insert (format "%s " time) "|" action "|" 
+	      (format "%s|%s|%s\n" pt 0 buf)))))
 
 (defun cslc--record-existing-buffer-contents ()
   "records the existing change of mode event in a timequeue"
@@ -892,8 +909,9 @@ Default CSD - A CSD to run when Csound starts
 	(goto-char (point-min))
 	(while (not (eobp))
 	  (let* ((event (split-string (thing-at-point 'line) "|"))
-		 (tqbufname (replace-regexp-in-string "\n$" ""  (elt event 4))))
-	    (unless (member tqbufname bufnames)	       	      
+		 (tqbufname (replace-regexp-in-string "\n$" ""  (elt event 4)))
+		 (action (elt event 1)))
+	    (unless (or (member tqbufname bufnames) (string-prefix-p "GLOSS:" action))
 	      (let* ((destinationbufname (cslc--perfbuffer-name tqbufname))
 		     (destbuf (get-buffer-create destinationbufname))
 		     (indbuf (cslc--get-indirect-buffer-create destinationbufname))
@@ -964,6 +982,13 @@ Default CSD - A CSD to run when Csound starts
       (goto-char cslc--timequeue-point)
       (setq cslc--performance-start-time (read (thing-at-point 'line)))
       (cslc--pollaction (float-time cslc--performance-start-time)))))
+
+(defun cslc-toggle-pause-playback ()
+  (interactive)
+  (message "cslc-toggle-pause-playback")
+  (if (string= cslc--recordingflag "Paused Performance")
+      (cslc-pause-playback)
+    (cslc-resume-playback)))
 
 (defun cslc-start-recording ()
   "Begin recording all text changes and evaluations in the current buffer
